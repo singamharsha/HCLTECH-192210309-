@@ -1,0 +1,657 @@
+use role accountadmin;
+drop database HEALTHCARE_ADVANCED_DB1;
+ CREATE OR REPLACE DATABASE HEALTHCARE_ADVANCED_DB1;
+USE DATABASE HEALTHCARE_ADVANCED_DB1;
+
+CREATE OR REPLACE WAREHOUSE HEALTHCARE_WH
+WITH WAREHOUSE_SIZE='X-SMALL' 
+AUTO_SUSPEND=60 
+AUTO_RESUME=TRUE ;
+USE WAREHOUSE HEALTHCARE_WH;
+
+CREATE OR REPLACE SCHEMA raw;
+CREATE OR REPLACE SCHEMA validated;
+CREATE OR REPLACE SCHEMA curated;
+CREATE OR REPLACE SCHEMA external_stages;
+CREATE OR REPLACE SCHEMA governance;
+CREATE OR REPLACE SCHEMA datamart;
+CREATE OR REPLACE SCHEMA analytical;
+
+-- =========================================================================
+-- 1. RAW LAYER & INGESTION
+-- =========================================================================
+CREATE OR REPLACE FILE FORMAT raw.csv_format
+  TYPE = 'CSV'
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  NULL_IF = ('', 'NULL', 'null')
+  EMPTY_FIELD_AS_NULL = TRUE
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"';
+
+
+CREATE OR REPLACE STAGE external_stages.healthcare_stage;
+
+create or replace storage integration health_aws
+type=EXTERNAL_STAGE
+STORAGE_PROVIDER = S3
+ENABLED = TRUE
+STORAGE_AWS_ROLE_ARN = 'arn:aws:iam::007664619601:role/health-care1'
+STORAGE_ALLOWED_LOCATIONS = ('s3://health-care-adv');
+
+CREATE OR REPLACE STAGE external_stages.healthcare_stage
+URL = 's3://health-care-adv'
+STORAGE_INTEGRATION = health_aws
+FILE_FORMAT = raw.csv_format;
+
+DESC INTEGRATION external_stages.healthcare_stage;
+
+list @external_stages.healthcare_stage;
+
+
+
+-- Raw Tables
+CREATE OR REPLACE TABLE raw.raw_patients (
+    patient_id VARCHAR,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    dob DATE,
+    gender VARCHAR,
+    blood_group VARCHAR,
+    city VARCHAR,
+    state VARCHAR,
+    registration_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_appointments (
+    appointment_id VARCHAR,
+    patient_id VARCHAR,
+    appointment_date TIMESTAMP_NTZ,
+    department VARCHAR,
+    doctor_id VARCHAR,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_medical_records (
+    record_id VARCHAR,
+    patient_id VARCHAR,
+    diagnosis VARCHAR,
+    heart_rate VARCHAR, -- Read as varchar to catch bad cast
+    blood_pressure_systolic VARCHAR,
+    blood_pressure_diastolic VARCHAR,
+    cholesterol_level VARCHAR,
+    record_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE raw.raw_billing (
+    bill_id VARCHAR,
+    patient_id VARCHAR,
+    appointment_id VARCHAR,
+    total_amount VARCHAR,
+    insurance_covered VARCHAR,
+    patient_paid VARCHAR,
+    billing_date TIMESTAMP_NTZ,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+
+-- Streams
+CREATE OR REPLACE STREAM raw.patients_stream ON TABLE raw.raw_patients;
+CREATE OR REPLACE STREAM raw.appointments_stream ON TABLE raw.raw_appointments;
+CREATE OR REPLACE STREAM raw.medical_records_stream ON TABLE raw.raw_medical_records;
+CREATE OR REPLACE STREAM raw.billing_stream ON TABLE raw.raw_billing;
+
+-- COPY INTO Commands (Execute these after uploading CSVs to @external_stages.healthcare_stage)
+COPY INTO raw.raw_patients (patient_id, first_name, last_name, dob, gender, blood_group, city, state, registration_date)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.*patients.*\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_appointments (appointment_id, patient_id, appointment_date, department, doctor_id, status)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.*appointments.*\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_medical_records (record_id, patient_id, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.*medical_records.*\.csv'
+ON_ERROR = CONTINUE;
+
+COPY INTO raw.raw_billing (bill_id, patient_id, appointment_id, total_amount, insurance_covered, patient_paid, billing_date, status)
+FROM @external_stages.healthcare_stage
+FILE_FORMAT = raw.csv_format
+PATTERN = '.*billing.*\.csv'
+ON_ERROR = CONTINUE;
+
+
+-- =========================================================================
+-- 2. VALIDATED LAYER (Data Cleaning & DQ Logging)
+-- =========================================================================
+CREATE OR REPLACE TABLE validated.valid_patients (
+    patient_id VARCHAR PRIMARY KEY,
+    first_name VARCHAR,
+    last_name VARCHAR,
+    dob DATE,
+    gender VARCHAR,
+    blood_group VARCHAR,
+    city VARCHAR,
+    state VARCHAR,
+    registration_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_appointments (
+    appointment_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    appointment_date TIMESTAMP_NTZ,
+    department VARCHAR,
+    doctor_id VARCHAR,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_medical_records (
+    record_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    diagnosis VARCHAR,
+    heart_rate NUMBER,
+    blood_pressure_systolic NUMBER,
+    blood_pressure_diastolic NUMBER,
+    cholesterol_level NUMBER,
+    record_date TIMESTAMP_NTZ,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+CREATE OR REPLACE TABLE validated.valid_billing (
+    bill_id VARCHAR PRIMARY KEY,
+    patient_id VARCHAR,
+    appointment_id VARCHAR,
+    total_amount FLOAT,
+    insurance_covered FLOAT,
+    patient_paid FLOAT,
+    billing_date TIMESTAMP_NTZ,
+    status VARCHAR,
+    _load_timestamp TIMESTAMP_NTZ
+);
+
+-- Governance Exception Tables
+CREATE OR REPLACE TABLE governance.dq_exception_log (
+    error_id VARCHAR DEFAULT UUID_STRING(),
+    source_table VARCHAR,
+    business_key VARCHAR,
+    error_type VARCHAR,
+    error_message VARCHAR,
+    _recorded_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+CREATE OR REPLACE TABLE governance.anomaly_rule_hits (
+    anomaly_id VARCHAR DEFAULT UUID_STRING(),
+    rule_name VARCHAR,
+    business_key VARCHAR,
+    anomaly_desc VARCHAR,
+    detected_at TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+);
+
+-- Stored Procedure for DQ and Merging
+CREATE OR REPLACE PROCEDURE validated.process_data_quality()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- 1. PROCESS PATIENTS
+    CREATE TEMPORARY TABLE cur_patients_stream AS SELECT * FROM raw.patients_stream WHERE METADATA$ACTION = 'INSERT';
+    
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_patients', patient_id, 'NULL_VALUES', 'Missing Gender or City'
+    FROM cur_patients_stream WHERE gender IS NULL OR city IS NULL;
+
+    MERGE INTO validated.valid_patients tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY patient_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_patients_stream WHERE gender IS NOT NULL AND city IS NOT NULL
+        ) WHERE rn = 1
+    ) src ON tgt.patient_id = src.patient_id
+    WHEN MATCHED THEN UPDATE SET tgt.first_name = UPPER(src.first_name), tgt.last_name = UPPER(src.last_name), tgt.city = UPPER(src.city), tgt.state = UPPER(src.state), tgt.gender = src.gender, tgt.blood_group = src.blood_group
+    WHEN NOT MATCHED THEN INSERT (patient_id, first_name, last_name, dob, gender, blood_group, city, state, registration_date, _load_timestamp)
+    VALUES (src.patient_id, UPPER(src.first_name), UPPER(src.last_name), src.dob, src.gender, src.blood_group, UPPER(src.city), UPPER(src.state), src.registration_date, src._load_timestamp);
+
+    -- 2. PROCESS APPOINTMENTS
+    CREATE TEMPORARY TABLE cur_appointments_stream AS SELECT * FROM raw.appointments_stream WHERE METADATA$ACTION = 'INSERT';
+    
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_appointments', appointment_id, 'INVALID_STATUS', CONCAT('Status ', status, ' is invalid')
+    FROM cur_appointments_stream WHERE status NOT IN ('Scheduled', 'Completed', 'No-Show');
+
+    MERGE INTO validated.valid_appointments tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY appointment_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_appointments_stream 
+            WHERE status IN ('Scheduled', 'Completed', 'No-Show')
+              AND patient_id IN (SELECT patient_id FROM validated.valid_patients)
+        ) WHERE rn = 1
+    ) src ON tgt.appointment_id = src.appointment_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.appointment_date = src.appointment_date
+    WHEN NOT MATCHED THEN INSERT (appointment_id, patient_id, appointment_date, department, doctor_id, status, _load_timestamp)
+    VALUES (src.appointment_id, src.patient_id, src.appointment_date, UPPER(src.department), src.doctor_id, src.status, src._load_timestamp);
+
+    -- 3. PROCESS MEDICAL RECORDS
+    CREATE TEMPORARY TABLE cur_medical_stream AS SELECT * FROM raw.medical_records_stream WHERE METADATA$ACTION = 'INSERT';
+
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_medical_records', record_id, 'DATA_TYPE_ERROR', 'Non-numeric clinical values'
+    FROM cur_medical_stream 
+    WHERE TRY_CAST(cholesterol_level AS NUMBER) IS NULL OR TRY_CAST(heart_rate AS NUMBER) IS NULL;
+
+    MERGE INTO validated.valid_medical_records tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY record_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_medical_stream
+            WHERE TRY_CAST(cholesterol_level AS NUMBER) IS NOT NULL
+              AND TRY_CAST(heart_rate AS NUMBER) IS NOT NULL
+              AND patient_id IN (SELECT patient_id FROM validated.valid_patients)
+        ) WHERE rn = 1
+    ) src ON tgt.record_id = src.record_id
+    WHEN MATCHED THEN UPDATE SET tgt.diagnosis = src.diagnosis, tgt.heart_rate = TRY_CAST(src.heart_rate AS NUMBER)
+    WHEN NOT MATCHED THEN INSERT (record_id, patient_id, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date, _load_timestamp)
+    VALUES (src.record_id, src.patient_id, src.diagnosis, TRY_CAST(src.heart_rate AS NUMBER), TRY_CAST(src.blood_pressure_systolic AS NUMBER), TRY_CAST(src.blood_pressure_diastolic AS NUMBER), TRY_CAST(src.cholesterol_level AS NUMBER), src.record_date, src._load_timestamp);
+
+    -- 4. PROCESS BILLING
+    CREATE TEMPORARY TABLE cur_billing_stream AS SELECT * FROM raw.billing_stream WHERE METADATA$ACTION = 'INSERT';
+
+    INSERT INTO governance.dq_exception_log (source_table, business_key, error_type, error_message)
+    SELECT 'raw_billing', bill_id, 'VALUE_ERROR', 'Negative or missing amount'
+    FROM cur_billing_stream WHERE TRY_CAST(total_amount AS FLOAT) < 0 OR TRY_CAST(total_amount AS FLOAT) IS NULL;
+
+    MERGE INTO validated.valid_billing tgt
+    USING (
+        SELECT * FROM (
+            SELECT *, ROW_NUMBER() OVER(PARTITION BY bill_id ORDER BY _load_timestamp DESC) as rn
+            FROM cur_billing_stream
+            WHERE TRY_CAST(total_amount AS FLOAT) >= 0
+              AND appointment_id IN (SELECT appointment_id FROM validated.valid_appointments)
+        ) WHERE rn = 1
+    ) src ON tgt.bill_id = src.bill_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.total_amount = TRY_CAST(src.total_amount AS FLOAT)
+    WHEN NOT MATCHED THEN INSERT (bill_id, patient_id, appointment_id, total_amount, insurance_covered, patient_paid, billing_date, status, _load_timestamp)
+    VALUES (src.bill_id, src.patient_id, src.appointment_id, TRY_CAST(src.total_amount AS FLOAT), TRY_CAST(src.insurance_covered AS FLOAT), TRY_CAST(src.patient_paid AS FLOAT), src.billing_date, src.status, src._load_timestamp);
+
+    COMMIT;
+    RETURN 'Validation and Insert into VALIDATED layer completed successfully.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in process_data_quality: ' || SQLERRM;
+END;
+$$;
+
+
+-- =========================================================================
+-- 3. CURATED LAYER (Dimensions & Facts with Surrogate Keys)
+-- =========================================================================
+
+-- SCD-2 Patient Dimension
+CREATE OR REPLACE TABLE curated.dim_patient (
+    patient_key STRING,
+    patient_id STRING,
+    full_name STRING,
+    dob DATE,
+    gender STRING,
+    blood_group STRING,
+    city STRING,
+    state STRING,
+    registration_date TIMESTAMP_NTZ,
+    effective_date DATE,
+    end_date DATE,
+    is_current BOOLEAN
+);
+
+-- Fact Appointments (Event Fact)
+CREATE OR REPLACE TABLE curated.fact_appointments (
+    appointment_key STRING,
+    appointment_id STRING,
+    patient_key STRING,
+    doctor_id STRING,
+    department STRING,
+    appointment_date TIMESTAMP_NTZ,
+    status STRING
+);
+
+-- Fact Medical Records (Metrics Fact)
+CREATE OR REPLACE TABLE curated.fact_medical_records (
+    record_key STRING,
+    record_id STRING,
+    patient_key STRING,
+    diagnosis STRING,
+    heart_rate NUMBER,
+    blood_pressure_systolic NUMBER,
+    blood_pressure_diastolic NUMBER,
+    cholesterol_level NUMBER,
+    record_date TIMESTAMP_NTZ
+);
+
+-- Fact Billing (Financial Fact)
+CREATE OR REPLACE TABLE curated.fact_billing (
+    billing_key STRING,
+    bill_id STRING,
+    appointment_key STRING,
+    patient_key STRING,
+    total_amount FLOAT,
+    insurance_covered FLOAT,
+    patient_paid FLOAT,
+    billing_date TIMESTAMP_NTZ,
+    status STRING
+);
+
+
+CREATE OR REPLACE PROCEDURE curated.populate_curated_models()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- 1. SCD-2 for PATIENT DIMENSION
+    UPDATE curated.dim_patient tgt
+    SET tgt.end_date = CURRENT_DATE(), tgt.is_current = FALSE
+    FROM validated.valid_patients src
+    WHERE tgt.patient_id = src.patient_id 
+      AND tgt.is_current = TRUE 
+      AND (tgt.city != src.city OR tgt.state != src.state);
+
+    MERGE INTO curated.dim_patient tgt
+    USING validated.valid_patients src
+    ON tgt.patient_id = src.patient_id AND tgt.is_current = TRUE
+    WHEN NOT MATCHED THEN 
+      INSERT (patient_key, patient_id, full_name, dob, gender, blood_group, city, state, registration_date, effective_date, end_date, is_current)
+      VALUES (UUID_STRING(), src.patient_id, CONCAT(src.first_name, ' ', src.last_name), src.dob, src.gender, src.blood_group, src.city, src.state, src.registration_date, CURRENT_DATE(), NULL, TRUE);
+
+    -- 2. FACT APPOINTMENTS
+    MERGE INTO curated.fact_appointments tgt
+    USING (
+         SELECT 
+            a.appointment_id,
+            p.patient_key,
+            a.doctor_id,
+            a.department,
+            a.appointment_date,
+            a.status
+         FROM validated.valid_appointments a
+         JOIN curated.dim_patient p ON a.patient_id = p.patient_id AND p.is_current = TRUE
+    ) src ON tgt.appointment_id = src.appointment_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status
+    WHEN NOT MATCHED THEN INSERT (appointment_key, appointment_id, patient_key, doctor_id, department, appointment_date, status)
+    VALUES (UUID_STRING(), src.appointment_id, src.patient_key, src.doctor_id, src.department, src.appointment_date, src.status);
+
+    -- 3. FACT MEDICAL RECORDS
+    MERGE INTO curated.fact_medical_records tgt
+    USING (
+         SELECT 
+            m.record_id,
+            p.patient_key,
+            m.diagnosis,
+            m.heart_rate,
+            m.blood_pressure_systolic,
+            m.blood_pressure_diastolic,
+            m.cholesterol_level,
+            m.record_date
+         FROM validated.valid_medical_records m
+         JOIN curated.dim_patient p ON m.patient_id = p.patient_id AND p.is_current = TRUE
+    ) src ON tgt.record_id = src.record_id
+    WHEN MATCHED THEN UPDATE SET tgt.diagnosis = src.diagnosis, tgt.heart_rate = src.heart_rate
+    WHEN NOT MATCHED THEN INSERT (record_key, record_id, patient_key, diagnosis, heart_rate, blood_pressure_systolic, blood_pressure_diastolic, cholesterol_level, record_date)
+    VALUES (UUID_STRING(), src.record_id, src.patient_key, src.diagnosis, src.heart_rate, src.blood_pressure_systolic, src.blood_pressure_diastolic, src.cholesterol_level, src.record_date);
+
+    -- 4. FACT BILLING
+    MERGE INTO curated.fact_billing tgt
+    USING (
+         SELECT 
+            b.bill_id,
+            fa.appointment_key,
+            p.patient_key,
+            b.total_amount,
+            b.insurance_covered,
+            b.patient_paid,
+            b.billing_date,
+            b.status
+         FROM validated.valid_billing b
+         JOIN curated.dim_patient p ON b.patient_id = p.patient_id AND p.is_current = TRUE
+         LEFT JOIN curated.fact_appointments fa ON b.appointment_id = fa.appointment_id
+    ) src ON tgt.bill_id = src.bill_id
+    WHEN MATCHED THEN UPDATE SET tgt.status = src.status, tgt.patient_paid = src.patient_paid
+    WHEN NOT MATCHED THEN INSERT (billing_key, bill_id, appointment_key, patient_key, total_amount, insurance_covered, patient_paid, billing_date, status)
+    VALUES (UUID_STRING(), src.bill_id, src.appointment_key, src.patient_key, src.total_amount, src.insurance_covered, src.patient_paid, src.billing_date, src.status);
+
+    COMMIT;
+    RETURN 'Curated models populated successfully.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in populate_curated_models: ' || SQLERRM;
+END;
+$$;
+
+
+-- =========================================================================
+-- 4. GOVERNANCE (Anomaly Engine)
+-- =========================================================================
+CREATE OR REPLACE PROCEDURE governance.run_anomaly_engine()
+RETURNS STRING
+LANGUAGE SQL
+AS
+$$
+BEGIN
+    BEGIN TRANSACTION;
+    -- Duplicate Appointments (Patient booked twice in same day)
+    INSERT INTO governance.anomaly_rule_hits (rule_name, business_key, anomaly_desc)
+    SELECT 'DOUBLE_BOOKED', patient_key, CONCAT('Patient booked twice on ', DATE(appointment_date))
+    FROM curated.fact_appointments
+    WHERE status != 'No-Show'
+    GROUP BY patient_key, DATE(appointment_date) HAVING COUNT(appointment_id) > 1;
+
+    -- Extreme Billing Outliers (> 3 Standard Deviations)
+    INSERT INTO governance.anomaly_rule_hits (rule_name, business_key, anomaly_desc)
+    WITH DeptAvg AS (
+        SELECT a.department, AVG(b.total_amount) as avg_amt, STDDEV(b.total_amount) as std_dev
+        FROM curated.fact_billing b JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key GROUP BY a.department
+    )
+    SELECT 'BILL_OUTLIER', b.bill_id, CONCAT('Amount ', b.total_amount, ' exceeds dept avg ', d.avg_amt)
+    FROM curated.fact_billing b
+    JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key
+    JOIN DeptAvg d ON a.department = d.department
+    WHERE b.total_amount > (d.avg_amt + (3 * COALESCE(d.std_dev, 1)));
+
+    COMMIT;
+    RETURN 'Anomaly Engine run executed.';
+EXCEPTION
+    WHEN OTHER THEN
+        ROLLBACK;
+        RETURN 'Error in run_anomaly_engine: ' || SQLERRM;
+END;
+$$;
+
+
+-- =========================================================================
+-- 5. ORCHESTRATION (Tasks)
+-- =========================================================================
+
+
+CREATE OR REPLACE TASK analytical.task_process_dq
+    WAREHOUSE = HEALTHCARE_WH
+    SCHEDULE = '1 MINUTE'
+    WHEN SYSTEM$STREAM_HAS_DATA('RAW.PATIENTS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.APPOINTMENTS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.MEDICAL_RECORDS_STREAM')
+      OR SYSTEM$STREAM_HAS_DATA('RAW.BILLING_STREAM')
+AS
+    CALL validated.process_data_quality();
+
+CREATE OR REPLACE TASK analytical.task_populate_curated
+    WAREHOUSE = HEALTHCARE_WH
+    AFTER analytical.task_process_dq
+AS 
+    CALL curated.populate_curated_models();
+
+CREATE OR REPLACE TASK analytical.task_anomaly_engine
+    WAREHOUSE = HEALTHCARE_WH
+    AFTER analytical.task_populate_curated
+AS 
+    CALL governance.run_anomaly_engine();
+
+ALTER TASK analytical.task_anomaly_engine RESUME;
+ALTER TASK analytical.task_populate_curated RESUME;
+ALTER TASK analytical.task_process_dq RESUME;
+
+
+-- =========================================================================
+-- 6. DATAMART LAYER (Solving the Prompt Requests)
+-- =========================================================================
+
+-- Requirement 1: Patient 360
+CREATE OR REPLACE VIEW datamart.patient_360_mart AS
+SELECT 
+    p.patient_key,
+    p.patient_id,
+    p.full_name,
+    DATEDIFF('year', p.dob, CURRENT_DATE()) AS age,
+    p.gender,
+    p.city,
+    COUNT(DISTINCT a.appointment_id) AS lifetime_appointments,
+    COUNT(DISTINCT m.record_id) AS lifetime_medical_records,
+    SUM(b.total_amount) AS lifetime_billing,
+    SUM(b.patient_paid) AS lifetime_out_of_pocket
+FROM curated.dim_patient p
+LEFT JOIN curated.fact_appointments a ON p.patient_key = a.patient_key
+LEFT JOIN curated.fact_medical_records m ON p.patient_key = m.patient_key
+LEFT JOIN curated.fact_billing b ON p.patient_key = b.patient_key
+WHERE p.is_current = TRUE
+GROUP BY p.patient_key, p.patient_id, p.full_name, p.dob, p.gender, p.city;
+
+
+-- Requirement 2: Risk Prediction Analysis
+CREATE OR REPLACE VIEW datamart.risk_prediction_mart AS
+SELECT 
+    p.patient_id,
+    p.full_name,
+    DATEDIFF('year', p.dob, CURRENT_DATE()) AS age,
+    m.diagnosis,
+    m.cholesterol_level,
+    m.blood_pressure_systolic,
+    CASE 
+        WHEN DATEDIFF('year', p.dob, CURRENT_DATE()) > 60 AND m.cholesterol_level > 240 AND m.blood_pressure_systolic > 140 THEN 'HIGH RISK'
+        WHEN m.cholesterol_level BETWEEN 200 AND 240 OR m.blood_pressure_systolic BETWEEN 120 AND 140 THEN 'MEDIUM RISK'
+        ELSE 'LOW RISK'
+    END AS health_risk_score,
+    m.record_date
+FROM curated.dim_patient p
+JOIN curated.fact_medical_records m ON p.patient_key = m.patient_key
+WHERE p.is_current = TRUE;
+
+
+-- Requirement 3: Revenue Trends
+CREATE OR REPLACE VIEW datamart.revenue_trends_mart AS
+SELECT 
+    DATE_TRUNC('month', b.billing_date) AS revenue_month,
+    a.department,
+    COUNT(DISTINCT b.bill_id) AS total_bills_issued,
+    SUM(b.total_amount) AS total_revenue,
+    SUM(b.insurance_covered) AS total_insurance_claims
+FROM curated.fact_billing b
+JOIN curated.fact_appointments a ON b.appointment_key = a.appointment_key
+GROUP BY revenue_month, a.department;
+
+
+-- Requirement 4: No-Show Analysis
+CREATE OR REPLACE VIEW datamart.no_show_mart AS
+SELECT 
+    department,
+    COUNT(*) AS total_appointments,
+    SUM(IFF(status = 'No-Show', 1, 0)) AS total_missed_appointments,
+    ROUND((SUM(IFF(status = 'No-Show', 1, 0)) * 100.0) / NULLIF(COUNT(*), 0), 2) AS no_show_rate_percent
+FROM curated.fact_appointments
+GROUP BY department;
+
+
+-- =========================================================================
+-- 7. ANALYTICAL LAYER (Actionable KPIs for Dashboards)
+-- =========================================================================
+
+-- KPI 1: Enterprise Health Risk Ratio
+CREATE OR REPLACE VIEW analytical.kpi_health_risk AS
+SELECT 
+    COUNT(IFF(health_risk_score = 'HIGH RISK', 1, NULL)) AS total_high_risk_patients,
+    COUNT(*) AS total_patients_analyzed,
+    ROUND((COUNT(IFF(health_risk_score = 'HIGH RISK', 1, NULL)) * 100.0) / NULLIF(COUNT(*), 0), 2) AS high_risk_percentage
+FROM datamart.risk_prediction_mart;
+
+select * from analytical.kpi_top_departments;
+-- KPI 2: Top Performing Departments (Financial)
+CREATE OR REPLACE VIEW analytical.kpi_top_departments AS
+SELECT 
+    department,
+    SUM(total_revenue) AS ytd_revenue,
+    SUM(total_insurance_claims) AS ytd_insurance_claims
+FROM datamart.revenue_trends_mart
+GROUP BY department
+ORDER BY ytd_revenue DESC;
+
+-- KPI 3: Operational Inefficiency (No Shows)
+CREATE OR REPLACE VIEW analytical.kpi_operational_inefficiency AS
+SELECT 
+    department,
+    total_missed_appointments,
+    no_show_rate_percent
+FROM datamart.no_show_mart
+ORDER BY no_show_rate_percent DESC;
+
+-- KPI 4: Governance Quality Score
+CREATE OR REPLACE VIEW analytical.kpi_data_quality AS
+SELECT 
+    source_table,
+    error_type,
+    COUNT(error_id) AS total_anomalies_quarantined
+FROM governance.dq_exception_log
+GROUP BY source_table, error_type
+ORDER BY total_anomalies_quarantined DESC;
+
+-- END OF SCRIPT
+
+-- =========================================================================
+-- 8. SYSTEM ALERTS (Proactive Monitoring)
+-- =========================================================================
+
+-- Create an alert to notify admins if any business anomalies are detected
+CREATE OR REPLACE ALERT governance.high_anomaly_alert
+  WAREHOUSE = HEALTHCARE_WH
+  SCHEDULE = '10 MINUTE'
+  IF (EXISTS (
+      SELECT * 
+      FROM governance.anomaly_rule_hits 
+      WHERE detected_at > SNOWFLAKE.ALERT.LAST_SUCCESSFUL_SCHEDULED_TIME()
+  ))
+  THEN
+    -- Action: Send an email (Note: Requires a pre-configured email integration 'my_email_int')
+    CALL SYSTEM$SEND_EMAIL(
+        'my_email_int', 
+        'admin@hospital.com', 
+        'High Anomalies Detected', 
+        'Check governance.anomaly_rule_hits immediately for business rule violations.'
+    );
+
+ALTER ALERT governance.high_anomaly_alert RESUME;
+
+
+select * from analytical.kpi_top_departments;
+select * from analytical.kpi_health_risk;
+select * from analytical.kpi_operational_inefficiency;
+select * from analytical.kpi_data_quality;
